@@ -1,0 +1,1200 @@
+#!/usr/bin/ruby
+# DHTML Crossword Server
+# Copyright (C) 2007 Evan Martin <martine@danga.com>
+
+require 'rubygems'
+
+require 'cgi'
+require 'fileutils'
+require 'json'
+require 'googtmpl'
+require 'mongrel'
+require 'optparse'
+require 'thread'
+require 'yaml'
+
+require 'rubypuz/puz.rb'
+
+# Command-line flags.
+$opts = {
+  :log_http => false,
+  :singleplayer => false,
+
+  # Internal debugging mode:
+  #  - add /quit handler to shut down server programmatically.
+  :debug => false
+}
+
+# Tell Mongrel that we want full backtraces on errors.
+$mongrel_debug_client = true
+
+# Print verbose messages about HTTP requests.
+$debug_http = false
+
+# Crash if a thread sees an exception.
+Thread.abort_on_exception = true
+
+# crossword_to_hash: given a RubyPuz Crossword object, convert it into
+# a hash suitable for JSON'ing over to the JS client.
+def crossword_to_hash cw
+  # We pass the clues list as an array instead of a hash because we
+  # want the clues in order.
+  def make_clueslist(clues)
+    clues.keys.sort.map do |num|
+      [num, clues[num]]
+    end
+  end
+  {
+    'title'     => cw.title,
+    'author'    => cw.author,
+    'copyright' => cw.copyright,
+    'width'     => cw.width,
+    'height'    => cw.height,
+    'answer' =>
+      (0...cw.height).map do |y|
+        (0...cw.height).map do |x|
+          square = cw.squares[x][y]
+          square && square.answer ? ' ' : '.'
+        end.join('')
+      end.join(''),
+    'numbers' =>
+      (0...cw.height).map do |y|
+        (0...cw.width).map do |x|
+          square = cw.squares[x][y]
+          square && square.number ? square.number : 0
+        end
+      end,
+    'down'   => make_clueslist(cw.down),
+    'across' => make_clueslist(cw.across)
+  }
+end
+
+def log(str)
+  puts "#{Time.now.strftime '%Y%m%d %H%M%S'} #{str}" if $opts[:debug]
+end
+
+class String
+  def xml_escape
+    to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+  end
+end
+
+# CrosswordStore supplies the actual crossword data, allowing enumerating
+# crosswords and fetching a given crossword by name.
+class CrosswordStore
+  attr_reader :crosswords
+
+  def initialize(datapath)
+    refresh(datapath)
+  end
+
+  def refresh(datapath)
+    # All available crosswords, mapping file basename => Puz obj
+    @crosswords = {}
+    load_crosswords datapath
+  end
+
+  # Load all the crosswords found in the datadir path.
+  def load_crosswords(datapath)
+    print "Loading crosswords... "; $stdout.flush
+    crossword_count = 0
+    Dir["#{datapath}/*.puz"].sort.each do |path|
+      name = File::basename(path, '.puz')
+      print "#{name} "; $stdout.flush
+      load_crossword(name, path)
+      crossword_count += 1
+    end
+    if crossword_count < 1
+      puts "no crosswords found.  (Specify a data path with --data.)"
+      exit 1
+    else
+      puts  # finish off "loading..." line.
+    end
+  end
+
+  # Load a single crossword into @crosswords hash
+  def load_crossword(name, path)
+    crossword = Crossword.new
+    File::open(path) { |f| crossword.parse(f) }
+    @crosswords[name] = crossword
+  end
+
+  def in_order
+    @crosswords.to_a.sort_by { |name, crossword| crossword.title }
+  end
+
+  def include? cw
+    @crosswords.has_key? cw
+  end
+  def get_crossword cw
+    @crosswords[cw]
+  end
+end
+
+# SessionState holds the state of a crossword in a multiplayer session.
+class SessionState
+  attr_reader :cells, :crossword, :roster
+
+  # By default, players are dropped if this many seconds elapse between the
+  # end of one state poll and the beginning of the next one.
+  SESSION_TIMEOUT = 30
+
+  class Cell
+    attr_accessor :letter, :guess, :uid, :version
+    def initialize
+      @letter = ' '
+      @guess = false
+      @uid = nil
+      @version = 0
+    end
+  end
+
+  class Roster
+    class User
+      DEFAULT_COLOR = '#ddd'
+      attr_accessor :name, :session_uid, :roster_version, :color, \
+        :last_message_num, :letters_version, :poll_end, :gave_up, \
+        :cursor_x, :cursor_y, :cursor_version, :cursors_version
+      def initialize
+        @name = 'anonymous'
+        @session_uid = nil
+        @roster_version = nil
+        @color = DEFAULT_COLOR
+        @last_message_num = nil
+        @letters_version = nil
+        @gave_up = false
+        @cursor_x = nil
+        @cursor_y = nil
+        @cursor_version = nil   # our cursor's version
+        @cursors_version = nil  # the latest cursor state we've received
+
+        # When the last (XMLHTTPRequest) poll ended, or -1 if a poll is
+        # currently in progress.
+        @poll_end = nil
+      end
+
+      def get_html(suffix='')
+        "<span class='name' style='background:#@color'>#{@name+suffix}</span>"
+      end
+    end
+
+    def initialize
+      @version = 0  # incremented every time a user is added or changed
+      @users = {}
+      @available_session_uids = ('a'..'z').map + ('A'..'Z').map
+      @available_colors = %w{#eea #fcb #cfc #adf #ebf}
+    end
+    attr_reader :users
+
+    def get_session_uid(uid)
+      # We use -1 as the uid for squares that were filled in because all
+      # players gave up.  We use session uid '0' for these.
+      return '0' if uid == -1
+      @users[uid].session_uid
+    end
+
+    def change_name(uid, name)
+      @users[uid].name = name
+      @version += 1
+    end
+
+    def get_user(uid)
+      @users[uid]
+    end
+
+    # Drop a user from the roster.
+    # Its session uid and color are returned to the @available_* lists.
+    def drop_user(uid)
+      u = @users[uid]
+      @available_session_uids << u.session_uid
+      @available_colors << u.color if u.color != User::DEFAULT_COLOR
+      @users.delete uid
+      @version += 1
+    end
+
+    def create_user(uid)
+      return if @users[uid]
+      user = User.new
+      user.session_uid = @available_session_uids.shift
+      user.color = @available_colors.shift if @available_colors.length > 0
+      @users[uid] = user
+      @version += 1
+      user
+    end
+
+    # Poll for updates to the roster.  If this is the uid's first poll,
+    # it's added to the roster.  If a new roster is available, it's
+    # returned in array->hash form, ready for direct conversion to JSON.
+    # Otherwise, an empty array is returned.  The user's roster version is
+    # updated accordingly.
+    def poll(uid, force)
+      user = @users[uid]
+      roster = []
+      if force or not user.roster_version or user.roster_version < @version
+        @users.each do |uid, u|
+          roster << {
+            'uid' => u.session_uid,
+            'name' => u.name,
+            'color' => u.color,
+          }
+        end
+      end
+      user.roster_version = @version
+      roster
+    end
+
+    # Get users who haven't polled since at least 'expire_sec' ago.
+    # An array of uids of users is returned.
+    def get_users_to_drop(expire_sec)
+      @users.keys.find_all do |uid|
+        u = @users[uid]
+        elapsed =
+          (u.poll_end and u.poll_end.to_f > 0) ?
+          (Time.now - u.poll_end).to_f : 0
+        elapsed > expire_sec
+      end
+    end
+
+    def user_count
+      @users.size
+    end
+  end
+
+
+  class MessageLog
+    class Message
+      attr_reader :text, :uid, :time
+      def initialize(text, uid=nil)
+        @text = text
+        @uid = uid
+        @time = Time.now
+      end
+    end
+
+    def initialize
+      @messages = []
+    end
+
+    def add(text, uid=nil)
+      @messages << Message.new(text, uid)
+    end
+
+    # Get an array containing all messages newer than the index
+    # 'last_received'.
+    def get_messages(last_received)
+      last_received ||= -1
+      @messages[(last_received+1..last_message_num)]
+    end
+
+    def last_message_num
+      @messages.size - 1
+    end
+  end
+
+  def initialize(state_file=nil, crossword_store=nil)
+    # We keep one roster and message list across all crosswords this
+    # session displays.
+    @roster = Roster.new
+    @messages = MessageLog.new
+    deserialize(File.open(state_file), crossword_store) if state_file
+
+    # We protect state changes with a mutex.
+    @update_mutex = Mutex.new
+    # Clients that wait for an update wait on this condition.
+    @update_condition = ConditionVariable.new
+    @correct = correct?
+
+    # last @letters_version that was saved to disk
+    @saved_letters_version = nil
+
+    @cursors_version = 0
+
+    # number of threads waiting on a uid for state
+    @num_waiters_by_uid = {}
+
+    @drop_users_thread = Thread.new do
+      loop do
+        drop_users
+        sleep 5
+      end
+    end
+  end
+
+  def load_crossword(crossword, crossword_name)
+    @crossword = crossword
+    @crossword_name = crossword_name
+    raise "CrosswordState load: nil crossword!" unless crossword
+    @cells = (0...@crossword.width).map do
+      (0...@crossword.height).map do
+        Cell.new
+      end
+    end
+    @letters_version = 0
+  end
+
+  # Serialize the session state (currently, just the filled-in letters) and
+  # write it to the passed-in file.
+  def serialize(file)
+    return if not @crossword
+    file.write({
+      'crossword_name' => @crossword_name,
+      'cell_rows' =>
+        (0...@crossword.height).map do |y|
+          (0...@crossword.width).map do |x|
+            cell = @cells[x][y]
+            cell.guess ? cell.letter.downcase : cell.letter.upcase
+          end.join('')
+        end,
+    }.to_yaml)
+  end
+
+  # Deserialize the session state contained in the passed-in file (which
+  # should've been written by the serialize() method).
+  def deserialize(file, crossword_store)
+    s = YAML.load file
+
+    # When they haven't picked a crossword yet, serialize() outputs an
+    # empty file.  YAML.load parses this file as boolean false.
+    return unless s
+
+    name = s['crossword_name']
+    if not name
+      puts "Session is missing crossword name; not restoring"
+      return
+    end
+
+    crossword = crossword_store.get_crossword name
+    if not crossword
+      puts "Couldn't find crossword '#{name}' to restore session"
+      return
+    end
+    load_crossword crossword, name
+
+    s['cell_rows'].each_with_index do |r, y|
+      r.split('').each_with_index do |ch, x|
+        cell = @cells[x][y]
+        cell.letter = ch.upcase
+        cell.guess = ('a'..'z').include? ch
+        cell.uid = nil
+      end
+    end
+    @letters_version += 1
+  end
+
+  # This should be called whenever a user's hanging request is closed, so
+  # we can drop departed players who don't reopen a new connection.
+  def register_poll_end(uid)
+    @update_mutex.synchronize do
+      u = @roster.get_user(uid)
+      # If there's still another connection for this user, don't register
+      # the poll time (see wait_for_new_state() for gory details).
+      u.poll_end = Time.now if u and @num_waiters_by_uid[uid] == 0
+    end
+  end
+
+  # Drop a user from the session.
+  # Cell ownership is relinquished and a message is sent (if 'disconnected'
+  # is false, we say that the user timed out; otherwise they left of their
+  # own accord).
+  def drop_user(uid, disconnected)
+    u = @roster.get_user(uid)
+    @cells.each do |col|
+      col.each do |cell|
+        if cell.uid == uid
+          cell.uid = nil
+          @letters_version += 1
+        end
+      end
+    end
+    @messages.add(
+      "#{u.get_html} #{disconnected ? "left the game" : "timed out"}.")
+    @roster.drop_user(uid)
+    give_up(nil)  # check if this means that enough players have given up
+  end
+
+  # Check all users and drop ones who've been inactive for too long.
+  def drop_users
+    @update_mutex.synchronize do
+      uids = @roster.get_users_to_drop(SESSION_TIMEOUT)
+      if uids.size > 0
+        uids.each do |uid|
+          log "dropping timed-out user #{uid}"
+          u = @roster.get_user uid
+          drop_user uid, false
+        end
+        announce_update
+      end
+    end
+  end
+
+  # solve all of the crossword except one cell; used for testing
+  def nearly_complete_crossword
+    # fill in all squares except the first one
+    (0...@crossword.height).map do |y|
+      (0...@crossword.width).map do |x|
+        state_square = @cells[x][y]
+        cw_square = @crossword.squares[x][y]
+        if state_square and cw_square and not (x == 0 and y == 0)
+          state_square.letter = cw_square.answer
+        end
+      end
+    end
+  end
+
+  # Is the crossword correctly filled in?
+  def correct?(allow_partial=false)
+    return false if not @crossword
+    (0...@crossword.height).map do |y|
+      (0...@crossword.width).map do |x|
+        state_square = @cells[x][y]
+        cw_square = @crossword.squares[x][y]
+        if state_square and cw_square and
+            state_square.letter != cw_square.answer
+          return false unless (allow_partial and state_square.letter == ' ')
+        end
+      end
+    end
+    return true
+  end
+
+  # Write the current state of this session to 'filename' if it's changed
+  # since the last time it was written.  Returns true if the state was
+  # written and false otherwise.
+  def write_state_if_updated(filename)
+    wrote = false
+    @update_mutex.synchronize do
+      if not @saved_letters_version or
+          @saved_letters_version < @letters_version
+        tmp_filename = "#{filename}.tmp"
+        File.open(tmp_filename, 'w') {|f| serialize f }
+        FileUtils.mv tmp_filename, filename, :force => true
+        wrote = true
+        @saved_letters_version = @letters_version
+      end
+    end
+    wrote
+  end
+
+  # Should we force this user to reload the page, picking up a new
+  # crossword puzzle, instead of giving them the current state?  If the
+  # server is restarted and a session under a given name ends up with a
+  # different puzzle than it had before, we can identify users that need
+  # to be reloaded, since they won't exist but also won't be asking for
+  # full states.
+  def force_reload_for_uid?(uid, full)
+    (not @roster.get_user(uid) and not full) ? true : false
+  end
+
+  # Turn link-looking things (including clue references) in a text string
+  # into HTML links.
+  def linkify_message(str)
+    str.gsub! /\b([0-9]+)( *|-)(a|d|across|down)\b/i do |m|
+      # It kinda sucks to have JavaScript present in the server like this,
+      # but doing linkification in the client is harder.
+      across = $3[0...1].downcase == 'a'
+      "<a href='#' onclick='javascript:" +
+        "return this.parentNode.console.onClueLinkClicked(#{$1}," +
+        "#{across});'>#{m}</a>"
+    end
+    str.gsub! /\b(https?:\/\/[^ ]+?)([\]).,!?]*( |$))/ do |m|
+      "<a href='#{$1}' target='_blank'>#{$1}</a>#{$2}"
+    end
+    str
+  end
+
+  # Fill in the given square.
+  def fill_square(square, letter, uid, guess)
+    letter.upcase!
+    return if square.letter == letter and square.guess == guess
+    @letters_version += 1
+    if square.letter != letter
+      square.uid = (letter != ' ') ? uid : nil
+    end
+    square.letter = letter
+    square.version = @letters_version
+    square.guess = guess
+  end
+
+  # Handle the case where a user gives up, filling in incorrect squares if
+  # a majority of users have given up.
+  # If 'uid' is nil, we assume that a player has just left the game and
+  # check if a majority of players have now given up.
+  def give_up(uid)
+    return if @correct
+    if uid
+      user = @roster.get_user(uid)
+      return if user.gave_up
+      user.gave_up = true
+    end
+    num_quitters = @roster.users.values.find_all {|u| u.gave_up }.size
+    return if @roster.users.empty?
+    return if num_quitters.to_f / @roster.users.size <= 0.5
+    @messages.add('Filling in solution...')
+
+    (0...@crossword.height).map do |y|
+      (0...@crossword.width).map do |x|
+        state_square = @cells[x][y]
+        cw_square = @crossword.squares[x][y]
+        next if not state_square or not cw_square or
+          state_square.letter == cw_square.answer
+        fill_square(state_square, cw_square.answer, -1, false)
+      end
+    end
+    handle_correct
+  end
+
+  # Mark the board as correct.
+  def handle_correct
+    @correct = true
+    (0...@crossword.height).map do |y|
+      (0...@crossword.width).map do |x|
+        @cells[x][y].guess = false
+      end
+    end
+    @messages.add('<span class="correct">Puzzle complete!</span>')
+  end
+
+  # Post an event to the play queue, user playing character c in pos x,y
+  # uid, x, y, c -> nil
+  # Precondition: @update_mutex is held.
+  def handle_event(uid, eventid, vals)
+    user = @roster.get_user(uid)
+    if not user
+      puts "Ignoring event from invalid user #{uid}"
+      return
+    end
+
+    case eventid
+    when "xy"
+      return if @correct
+      return if vals.size != 3
+      x, y, ch = [vals[0].to_i, vals[1].to_i, vals[2]]
+      return if not ch or ch !~ /^[a-zA-Z ]$/
+      return if x < 0 or x >= @crossword.width or
+                y < 0 or y >= @crossword.height
+      cell = @cells[x][y]
+      fill_square(cell, ch, uid, ('a'..'z').include?(ch))
+      handle_correct if correct?
+    when "cursor"
+      return if vals.size != 2
+      x, y = vals[0].to_i, vals[1].to_i
+      return if x < 0 or x >= @crossword.width or
+                y < 0 or y >= @crossword.height
+      @cursors_version += 1
+      user.cursor_x = x
+      user.cursor_y = y
+      user.cursor_version = @cursors_version
+    when "name"
+      return if vals.size != 1
+      name = vals[0]
+      name.strip! if name
+      if not name or name !~ /^[- \w.,()!'"]+$/
+        puts "Ignoring invalid name \"#{name}\" from #{uid}"
+        return
+      end
+      old_name = user.get_html
+      @roster.change_name(uid, name)
+      @messages.add("#{old_name} is now known as #{user.get_html}.")
+    when "msg"
+      return if vals.size != 1
+      # We put the user color directly into the message, even though we're
+      # sending the session UID to the browser, so that new users will
+      # still be able to see the name and color of messages written by
+      # departed users.  (We send the session UID so the browser can look
+      # up the username to make the titlebar flash... kinda cheesy.)
+      msg = "#{user.get_html ':'} " + linkify_message(vals[0].xml_escape)
+      @messages.add(msg, uid)
+      give_up uid if vals[0] =~ /^\s*i\s+give\s+up[.!]?\s*$/
+    when "disconnect"
+      drop_user uid, true
+    else
+      puts "Ignoring invalid event with id \"#{eventid}\""
+    end
+  end
+
+  def handle_events(events)
+    @update_mutex.synchronize do
+      events.each {|e| handle_event(e[0], e[1], e[2]) }
+      announce_update
+    end
+  end
+
+  # Precondition: update_mutex is held.
+  # We return a hash of state updates for the supplied uid (empty if there
+  # are no updates), or nil if the user doesn't exist.  If 'full' is set,
+  # all state is returned (unless the user doesn't exist).
+  def get_state_for_user(uid, full)
+    state = {}
+
+    user = @roster.get_user(uid)
+    return nil if not user
+    user.poll_end = -1
+
+    roster = @roster.poll(uid, full)
+    if roster.length > 0
+      state['roster'] = roster
+      state['uid'] = @roster.get_session_uid(uid)
+    end
+
+    if full or not user.letters_version or
+        user.letters_version < @letters_version
+      cells = ''
+      (0...@crossword.height).map do |y|
+        (0...@crossword.width).map do |x|
+          cell = @cells[x][y]
+          if full or
+              not user.letters_version or
+              cell.version > user.letters_version
+            letter = cell.guess ? cell.letter.downcase : cell.letter.upcase
+            owner = cell.uid ? @roster.get_session_uid(cell.uid) : ' '
+            cells += [x, y, letter[0], owner[0]].pack('CCCC')
+          end
+        end
+      end
+      state['cells'] = cells if cells.size > 0
+      state['correct'] = true if @correct
+      user.letters_version = @letters_version
+    end
+
+    if not user.cursors_version or
+        user.cursors_version < @cursors_version
+      cursors = ''
+      @roster.users.each do |cuid, cuser|
+        if cuid != uid and
+            cuser.cursor_version and
+            (not user.cursors_version or
+              cuser.cursor_version > user.cursors_version) and
+            cuser.cursor_x and cuser.cursor_y
+          suid = @roster.get_session_uid(cuid)
+          cursors += [cuser.cursor_x, cuser.cursor_y, suid[0]].pack('CCC')
+        end
+      end
+      state['cursors'] = cursors if not cursors.empty?
+      user.cursors_version = @cursors_version
+    end
+
+    messages =
+      @messages.get_messages(full ? nil : user.last_message_num).map do |m|
+        h = {
+          'text' => m.text,
+          'time' => m.time.to_i,
+        }
+        if m.uid and @roster.get_user(m.uid)
+          h['uid'] = @roster.get_session_uid(m.uid)
+        end
+        h
+      end
+    state['messages'] = messages if messages.length > 0
+    user.last_message_num = @messages.last_message_num
+
+    state
+  end
+
+  def create_user_if_new(uid)
+    return if @roster.get_user(uid)
+    log "creating user #{uid}"
+    user = @roster.create_user(uid)
+    @messages.add("#{user.get_html} has joined the game.")
+    # We need to let the other players know that we've joined.
+    announce_update
+  end
+
+  # Grab the server state that needs to be sent to this user.
+  # If there is no new state; block and wait on update_condition.
+  def wait_for_new_state(uid, full)
+    state = {}
+    @update_mutex.synchronize do
+      # When a user hits their reload button, their old state thread will
+      # continue blocking on @update_condition until the game state
+      # changes.  If we were to wake their old thread instead of their new
+      # one and send the state there, the new thread wouldn't see anything
+      # until the next event comes in.  To prevent this case, we track the
+      # number of threads per user.  If it exceeds 1, all of the old
+      # threads send back empty state the next time they awake.
+      @num_waiters_by_uid[uid] ||= 0
+      @num_waiters_by_uid[uid] += 1
+      loop do
+        # If we have too many threads for this user, wake up the other ones
+        # so they can exit.
+        announce_update if @num_waiters_by_uid[uid] > 1
+        state = get_state_for_user(uid, full)
+        break unless state and state.empty?
+        @update_condition.wait @update_mutex
+        if @num_waiters_by_uid[uid] > 1
+          puts "uid #{uid} has #{@num_waiters_by_uid[uid]} state " +
+            "threads; returning empty state"
+          break
+        end
+      end
+      @num_waiters_by_uid[uid] -= 1
+    end
+
+    return state
+  end
+
+  # Wake up all threads that were waiting for an update.
+  # Precondition: @update_mutex is already held.
+  def announce_update
+    log "announce_update"
+    @update_condition.broadcast
+  end
+
+  # Starts a thread that updates a random cell every 'interval' seconds.
+  # Possibly useful for debugging if you want to trigger a bunch of
+  # updates to try to find memory leaks in the JavaScript code.
+  def start_random_updates(interval)
+    return if not @crossword
+    @random_update_thread = Thread.new do
+      loop do
+        chars = ('A'..'Z').to_a
+        cell = @cells[rand(@crossword.width)][rand(@crossword.height)]
+        @update_mutex.synchronize do
+          @letters_version += 1
+          cell.letter = chars[rand(chars.length)]
+          cell.version = @letters_version
+          announce_update
+        end
+        sleep interval
+      end
+    end
+  end
+end
+
+class SessionManager
+  attr_reader :sessions
+
+  def initialize(session_dir)
+    @sessions = {}
+    @session_dir = session_dir
+    if not File.directory? @session_dir
+      puts "Creating session dir #{@session_dir}"
+      FileUtils.mkdir @session_dir
+    end
+
+    resume_sessions
+
+    if $opts[:debug] and not @sessions['test']
+      @sessions['test'] = SessionState.new
+      @sessions['test'].load_crossword($crossword_store.crosswords.values[0],
+                                       $crossword_store.crosswords.keys[0])
+    end
+
+    # Back up session states to disk periodically.
+    @save_interval_sec = 5
+    @save_thread = Thread.new do
+      loop do
+        @sessions.each do |name, sess|
+          sess.write_state_if_updated "#{@session_dir}/#{name}"
+        end
+        sleep @save_interval_sec
+      end
+    end
+  end
+
+  def resume_sessions
+    Dir.foreach @session_dir do |name|
+      next if name =~ /\.tmp$/
+      filename = "#{@session_dir}/#{name}"
+      if File.file? filename
+        puts "Restoring session '#{name}' from #{filename}"
+        session = SessionState.new(filename, $crossword_store)
+        next if not session.crossword
+        @sessions[name] = session
+      end
+    end
+  end
+
+  def get_session sess
+    return @sessions[sess]
+  end
+
+  def new_session name
+    name.gsub! /[^-_\w]/, '_'
+    @sessions[name] = SessionState.new
+  end
+end
+
+$template_cache = {}
+
+# A wrapper around Mongrel's HTTP handler that adds some functionality.
+class HttpHandler < Mongrel::HttpHandler
+  # An exception so we can pass 404s around more easily.
+  class NotFound < RuntimeError; end
+
+  def process(request, response)
+    p request.params if $debug_http
+    req_path = request.params['PATH_INFO']
+    puts "#{self.class.to_s} #{req_path}" if $opts[:log_http]
+    puts "request path #{req_path.inspect}" if $debug_http
+    return redirect_with_slash(request, response) if req_path.empty?
+    # The second param to split causes it to leave in trailing empty fields;
+    # otherwise we couldn't distinguish path "foo/" from just "foo".
+    path = req_path.split('/', -1)
+    path.shift  # Pop off empty first component.
+    puts "split path #{path.inspect}" if $debug_http
+    begin
+      req_main(request, response, path)
+    rescue NotFound
+      puts "404: #{req_path}"
+      response.start(404) do |head, out|
+        head['Content-type'] = 'text/plain'
+        out.puts "NOT FOUND"
+      end
+    end
+  end
+
+  def respond_with_file(request, response, filename, ctype)
+    response.start do |head, out|
+      head['Content-type'] = ctype
+      open(filename) { |f| out.write(f.read) }
+    end
+  end
+
+  # Fetch a template from the template dir.
+  def get_template(filename, strip_blanks=true)
+    template = $template_cache[filename]
+    return template if template
+    template = GoogTemplate::HTMLTemplate.new("templates/#{filename}.tmpl",
+                                              strip_blanks)
+    $template_cache[filename] = template
+    return template
+  end
+
+  # Serve a page prettified up by the site template.
+  #   title: page title
+  #   letters: stuff to show in letter boxes
+  #   depth: depth in directory tree (for css relative links), ew :(
+  #   filename: template basename in templates/
+  #   data: data for template
+  def serve_templated_page(response, title, letters, depth, filename, data)
+    csspath = '../' * depth + 'static/site.css'
+    content = ''
+    get_template(filename).render(content, data)
+    response.start do |head, out|
+      head['Content-type'] = 'text/html'
+      get_template('page').render(out, {
+        :title => title,
+        :letters => letters.split(//).map { |l| { :l => l } },
+        :css => csspath,
+        :content => content
+      })
+    end
+  end
+
+  # Respond with a redirect to a specific path.  We generate a redirect with
+  # the full host name so Apache's ProxyPassReverse can properly rewrite these.
+  def redirect_to(request, response, path)
+    path = "http://" + request.params['HTTP_HOST'] + path
+    puts "redirecting to #{path}" if $debug_http
+    response.socket.write(Mongrel::Const::REDIRECT % path)
+  end
+
+  # Redirect to the same URL with a slash appended.
+  def redirect_with_slash(request, response)
+    path = request.params['REQUEST_URI']
+    puts "#{path.inspect}: adding slash" if $debug_http
+    redirect_to(request, response, path + '/')
+  end
+end
+
+class SessionHandler < HttpHandler
+  COOKIE_NAME = 'lmnopuz-uid'
+  def initialize(cwh, session_dir)
+    @sessmgr = SessionManager.new session_dir
+    @crossword_handler = cwh
+  end
+
+  def get_request_uid(request)
+    cookie = CGI::Cookie.parse(request.params['HTTP_COOKIE'])[COOKIE_NAME]
+    (cookie and not cookie.empty?) ? cookie.value[0].to_i : nil
+  end
+
+  def create_uid
+    rand(1<<32)
+  end
+
+  # Process a state request for a specific session.
+  def req_state(request, response, session, body)
+    params = request.params['QUERY_STRING']?
+      CGI.parse(request.params['QUERY_STRING']) : {}
+    full = params.has_key?('full')
+
+    uid = get_request_uid request
+
+    set_uid_in_cookie = false
+    if not uid
+      if full
+        # XXX we should also check that cookies are enabled in javascript
+        uid = create_uid
+        set_uid_in_cookie = true
+        log "created new uid #{uid}"
+      else
+        puts "missing uid from #{request.params['REMOTE_ADDR']}"
+        response.start(400) do |head, out|
+          out.puts 'You must have session cookies enabled in your browser'
+        end
+        return
+      end
+    end
+
+    log "req_state start for #{uid}"
+
+    if session.force_reload_for_uid?(uid, full)
+      log "forcing #{uid} to reload the page"
+      state = { 'reload' => true }
+      forced_reload = true
+    else
+      session.create_user_if_new uid
+      # Block here, waiting for a state update.
+      state = session.wait_for_new_state(uid, full)
+    end
+
+    response.start do |head, out|
+      head['Content-type'] = 'text/javascript'
+      head['Set-Cookie'] = "#{COOKIE_NAME}=#{uid}" if set_uid_in_cookie
+      out.puts state.to_json if state
+    end
+    log "req_state end for #{uid} with #{state.inspect}"
+    session.register_poll_end uid if not forced_reload
+  end
+
+  # Process a state update for a specific session.
+  def req_update(request, response, session, body)
+    uid = get_request_uid request
+    if not uid
+      # XXX we should eval the javascript we get back from updates so
+      # this'll be displayed
+      puts "missing uid from #{request.params['REMOTE_ADDR']}"
+      response.start(400) do |head, out|
+        out.puts 'You must have session cookies enabled in your browser'
+      end
+      return
+    end
+    log "req_update start for #{uid}"
+
+    events = body.split("\n").map do |line|
+      event_type, *vals = line.split("\t")
+      log "#{event_type} event from uid #{uid}: #{vals.join(',')}"
+      [uid, event_type, vals]
+    end
+    session.handle_events(events) if not events.empty?
+
+    response.start do |head, out|
+      head['Content-type'] = 'text/plain'
+      # If the user isn't registered but they don't know it (e.g. their
+      # network connection is lame and their state request never even
+      # reached us, so they've timed out), let them know that they need to
+      # reconnect.
+      if session.force_reload_for_uid?(uid, false)
+        out.puts({ 'reload' => true }.to_json)
+      end
+    end
+    log "req_update end for #{uid}"
+  end
+
+  # Process a request underneath a specific session's path.
+  def req_session(request, response, session, path)
+    return req_sessionsetup(request, response, session) unless session.crossword
+    case path[0]
+    when 'state.js'
+      query = request.params['QUERY_STRING']
+      req_state(request, response, session, request.body.read)
+    when 'update'
+      if request.params['REQUEST_METHOD'] != 'POST'
+        response.send_status 400
+        return
+      end
+      req_update(request, response, session, request.body.read)
+    else
+      @crossword_handler.req_crossword(request, response,
+                                       session.crossword, path, true)
+    end
+  end
+
+  # Process a request on a session that hasn't had a game yet selected.
+  def req_sessionsetup(request, response, session)
+    case request.params['REQUEST_METHOD']
+    when 'GET'
+      # Show the "select crossword" form.
+      entries = $crossword_store.in_order.map do |name, crossword|
+        { :name => name, :title => crossword.title }
+      end
+      serve_templated_page(response, 'New Session', 'SETUP', 2,
+          'newsession',
+          { :name => "[Session object needs to hold the session's name, heh]",
+            :session => entries })
+    when 'POST'
+      # Process the input and redirect.
+      params = CGI.parse request.body.read
+      raise NotFound unless params.has_key? 'crossword'
+      cw = params['crossword'][0]
+      raise NotFound unless $crossword_store.include? cw
+      session.load_crossword($crossword_store.get_crossword(cw), cw)
+
+      # reload the current page.
+      redirect_to(request, response, request.params['REQUEST_PATH'])
+    end
+  end
+
+  # Process a request for the game list.
+  def req_list(request, response)
+    sessions = {}
+    unless @sessmgr.sessions.empty?
+      sessions = {
+        :session => @sessmgr.sessions.keys.sort.map do |sess|
+          { :url => "#{sess}/", :name => sess,
+            :users => @sessmgr.get_session(sess).roster.user_count }
+        end
+      }
+    end
+
+    serve_templated_page(response, 'Choose Session', 'SESSIONS', 1,
+        'session',
+        { :sessions => sessions.empty? ? false : sessions })
+  end
+
+  # Process a POST to create a new game.
+  def req_new_game(request, response, params)
+    raise NotFound unless params.has_key? 'name'
+    name = params['name'][0]
+    raise NotFound unless name =~ /^\w+$/
+    unless @sessmgr.get_session(name)
+      # Right here we could make the remote user the owner of the session
+      # or something...
+      @sessmgr.new_session(name)
+    end
+    redirect_to(request, response, "#{request.params['REQUEST_PATH']}#{name}/")
+  end
+
+  # Process a request at the toplevel /session/... URL.
+  def req_main(request, response, path)
+    session_name = path.shift
+    unless session_name.empty?
+      session = @sessmgr.get_session(session_name)
+      raise NotFound unless session
+      req_session(request, response, session, path)
+    else
+      case request.params['REQUEST_METHOD']
+      when 'GET'
+        req_list(request, response)
+      when 'POST'
+        params = CGI.parse request.body.read
+        req_new_game(request, response, params)
+      else
+        raise NotFound
+      end
+    end
+  end
+end
+
+class CrosswordHandler < HttpHandler
+  def req_list(request, response)
+    serve_templated_page(response, 'Choose Crossword', 'CROSSWORDS', 1,
+        'crosswordlist',
+        { :crossword => $crossword_store.in_order.map do |name, crossword|
+            title = crossword.title
+            title = name if title.empty?
+            { :url => name, :title => title }
+          end
+        })
+  end
+
+  # Process a request for a specific crossword.
+  def req_crossword(request, response, crossword, path, multiplayer)
+    return redirect_with_slash(request, response) if path.empty?
+    case path.shift
+    when ''
+      response.start do |head, out|
+        head['Content-type'] = 'text/html'
+        get_template('crossword', false).render(out, {
+          :multiplayer => multiplayer
+        })
+      end
+    when 'crossword.js'
+      response.start do |head, out|
+        out.print("var Crossword = " +
+                  crossword_to_hash(crossword).to_json +
+                  ";")
+      end
+    else
+      raise NotFound
+    end
+  end
+
+  # Process a request for /crossword/... URLs.
+  def req_main(request, response, path)
+    crossword_name = path.shift
+    unless crossword_name.empty?
+      crossword = $crossword_store.get_crossword(crossword_name)
+      raise NotFound unless crossword
+      req_crossword(request, response, crossword, path, false)
+    else
+      req_list(request, response)
+    end
+  end
+end
+
+class FrontPageHandler < HttpHandler
+  def req_main(request, response, path)
+    raise NotFound unless path == ['']
+
+    serve_templated_page(response, 'lmnopuz', 'LMNOPUZ', 0,
+        'frontpage',
+        { :numcrosswords => $crossword_store.crosswords.size,
+          :multi => !$opts[:singleplayer]
+        })
+  end
+end
+
+class QuitHandler < HttpHandler
+  def initialize(server)
+    @server = server
+  end
+  def req_main(request, response, path)
+    @server.stop
+  end
+end
+
+def main
+  bind = '0.0.0.0'
+  port = 2000
+  datadir = 'data'
+  sessiondir = ENV['HOME'] + '/.lmnopuz-sessions'
+
+  opts = OptionParser.new
+  opts.banner = "Usage: #{$0} [options]"
+  opts.on('--data DIR',  'Directory containing .puz files') { |datadir| }
+  opts.on('--port PORT', 'Port to listen on') { |port| }
+  opts.on('--sessiondir DIR', 'Directory where session data is ' +
+          'saved') { |sessiondir| }
+  opts.on('--singleplayer', 'Disable multiplayer') { |$opts[:singleplayer]| }
+  opts.on('--localhost', 'Bind only to localhost') do
+    puts "Listening only on local interface..."
+    bind = '127.0.0.1'
+  end
+  opts.on('--log-http', 'Log HTTP requests (not necessary if',
+                        'running behind Apache)') { |$opts[:log_http]| }
+  opts.on('--debug', 'Debug mode (add /quit handler)') { |$opts[:debug]| }
+  opts.on('--debug-http', 'Debug HTTP') { |$debug_http| }
+  opts.parse!
+
+  $crossword_store = CrosswordStore.new(datadir)
+
+  server = Mongrel::HttpServer.new(bind, port)
+  server.register('/', FrontPageHandler.new)
+  cwh = CrosswordHandler.new
+  server.register('/crossword', cwh)
+  server.register('/static/', Mongrel::DirHandler.new('static'))
+  unless $opts[:singleplayer]
+    server.register('/session', SessionHandler.new(cwh, sessiondir))
+  end
+  if $opts[:debug]
+    server.register('/quit', QuitHandler.new(server))
+  end
+  puts "Waiting for connections..."
+  server.run.join
+end
+
+main
+
+# vim: set ts=2 sw=2 et :

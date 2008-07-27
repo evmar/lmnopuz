@@ -1,0 +1,14 @@
+{{#SESSIONS}}
+<h2>Join an Existing Session</h2>
+<ul>
+{{#SESSION}}<li><a href="{{URL}}">{{NAME}}</a> (users: {{USERS}})</li>{{/SESSION}}
+</ul>
+{{/SESSIONS}}
+
+<h2>Start a New Session</h2>
+<form method='POST'>
+<p>Session name:
+  {{ }}<input type='text' name='name'>
+  {{ }}<input type='submit' value='Create'>
+</p>
+</form>

@@ -1,0 +1,256 @@
+<html>
+<head>
+<link rel="stylesheet" type="text/css" href="../../static/crossword.css"/>
+<style type='text/css'>
+body {
+  margin: 0ex 1ex;
+}
+body, td, input {
+  font-family: serif;
+}
+
+h1 {
+  font-size: 140%;
+  margin: 0.2ex 0;
+}
+
+h2 {
+  font-size: 110%;
+}
+
+h3 {
+  font-size: 100%;
+  margin: 0;
+}
+
+{{#MULTIPLAYER}}
+#console {
+ padding-right: 2ex;
+}
+{{/MULTIPLAYER}}
+
+#help {
+  z-index: 5;
+  position: fixed;
+  top: 2ex;
+  right: 2ex;
+  left: 2ex;
+  bottom: 2ex;
+  border: solid 1px black;
+  background: #ffc;
+  padding: 2em;
+  overflow: auto;
+  visibility: hidden;
+}
+#help ul, dl {
+  margin-top: 1ex;
+}
+#help dt {
+  font-weight: bold;
+  margin-top: 1ex;
+}
+#help dd {
+}
+
+</style>
+
+<script src='../../static/common.js'></script>
+<script src='../../static/console.js'></script>
+<script src='../../static/crosswordui.js'></script>
+<script src='../../static/cluesui.js'></script>
+<script src='../../static/focusbox.js'></script>
+<script src='../../static/roster.js'></script>
+{{#MULTIPLAYER}}
+<script src='../../static/multiplayer.js'></script>
+{{/MULTIPLAYER}}
+<script src='crossword.js'></script>
+<script>//<![CDATA[
+
+function $(id) { return document.getElementById(id); }
+
+function toggleHelp() {
+  if ($('help').style.visibility != 'visible') {
+    $('help').style.visibility = 'visible';
+  } else {
+    $('help').style.visibility = 'hidden';
+  }
+}
+
+function makeCrossword() {
+  Globals = {
+  };
+
+  $('title').innerHTML = Crossword.title;
+  var page_title = "lmnopuz";
+  if (Crossword.title) page_title += " - " + Crossword.title;
+  document.title = page_title;
+
+  Globals.focusbox = new FocusBox('blue', 3 /* width */ , 4 /* z-index */);
+
+  Globals.widget = new CrosswordWidget;
+  $('crossword').appendChild(Globals.widget.loadCrossword(Crossword));
+
+  Globals.console = new Console(150,
+                                {{#MULTIPLAYER}}true || {{/MULTIPLAYER}}false);
+  $('console').appendChild(Globals.console.container);
+
+  Globals.console.write(
+    "Welcome to lmnopuz! " +
+    {{#MULTIPLAYER}}
+    "Be sure to set your name by clicking on the link to the right. " +
+    {{/MULTIPLAYER}}
+    "lmnopuz has many nifty shortcut keys that you can learn about by " +
+    " clicking the \"Help\" link in the upper right corner.");
+
+  Globals.clues = new CluesUI(Crossword);
+  $('clues').appendChild(Globals.clues.container);
+
+  {{#MULTIPLAYER}}
+  Globals.roster = new Roster();
+  $('roster').appendChild(Globals.roster.container);
+
+  Globals.mp = new Multiplayer(document.location.href, Globals.widget,
+                               Globals.roster, Globals.console,
+                               Globals.roster.handleFirstLoad);
+  {{/MULTIPLAYER}}
+
+  handleResize();
+
+  // We need to wait to set focus until the table has been rendered (so
+  // that the offset stuff works) and until the clues have been created (so
+  // that the initial ones will be highlighted).  This kinda sucks.
+  Globals.widget.setFocus(Globals.widget.square(0, 0));
+};
+
+function handleResize() {
+  Globals.clues.setHeight($('crossword').childNodes[0].clientHeight);
+
+  // Resize the console to take up all available space in the window.  To
+  // do this, we subtract from the window height the console's top offset
+  // and the margin that we want to keep at the bottom.
+  Globals.console.setHeight(
+      document.body.clientHeight -
+      findPosY($('console').childNodes[0].childNodes[0]) -
+      (findPosY($('title')) + 5));  // fudge factor because title font don't
+                                    // quite reach the top of the window.
+
+  // Make the roster the same height as the console.
+  if (Globals.roster)
+    Globals.roster.setHeight($('console').childNodes[0].clientHeight);
+
+  // Make the width of the console/roster table match that of the
+  // crossword/clues table.
+  $('bottomtable').style.width = $('toptable').clientWidth;
+
+  Globals.console.scrollToBottom();
+};
+
+function handleBeforeUnload() {
+  if (Globals.mp) Globals.mp.shutdown();
+};
+
+function handleBlur() {
+  if (Globals) Globals.windowFocused = false;
+};
+
+function handleFocus() {
+  // TODO(derat): I suspect that we might not be getting an initial focus
+  // event in Safari (we seem to in Firefox).  If this is the case, we
+  // should just set Globals.windowFocused to true in makeCrossword().
+  if (Globals && !Globals.windowFocused) {
+    Globals.windowFocused = true;
+    Globals.console.stopTitleFlash();
+  }
+};
+
+//]]>
+</script>
+</head>
+
+<body onload='makeCrossword()'
+  onresize='javascript:handleResize(); return true'
+  onbeforeunload='javascript:handleBeforeUnload();'
+  onblur='javascript:handleBlur();'
+  onfocus='javascript:handleFocus();'>
+
+<div style='float:right'>
+<a onclick='toggleHelp();return false' href='#'>Help</a>
+</div>
+
+<h1 id='title'></h1>
+
+<div id='help' onclick="toggleHelp(); return false;">
+  <table><tr>
+<td valign='top' width='48%'>
+<h2>Basics</h2>
+<p>Move the cursor using the mouse and arrow keys, and enter answers with the
+keyboard.</p>
+<p>The <b>space bar</b> (as well as clicking again in the current cell)
+switches direction between across and down.</p> </ul>
+
+<h2>Advanced</h2>
+<dl>
+  <dt>Tab and Shift-Tab</dt>
+  <dd>Advance to the next clue along the current axis.  Shift reverses.</dd>
+
+  <dt>Shift (capital letters)</dt>
+  <dd>Hold shift while typing letters to mark an entry you're unsure of; the
+  letters will display in a lighter color.</dd>
+
+  <dt>Shift-Backspace, Shift-Delete</dt>
+  <dd>Clear the highlighted clue.</dd>
+
+  <dt>~</dt>
+  <dd>Toggle the highlighted clue between "unsure" and "sure".</dd>
+</dl>
+</td>
+{{#MULTIPLAYER}}
+<td width='4%'>&nbsp;</td>
+<td valign='top' width='48%'>
+<h2>Multiplayer Chat</h2>
+<p>Click in the box at the bottom to chat.  You can refer to clues with names
+like "43 across" or just "43a" and they will automatically become links to
+the clues.</p>
+
+<dl>
+  <dt>?</dt>
+  <dd>Call other players' attention to the clue you've currently focused.</dd>
+
+  <dt>/</dt>
+  <dd>Quickly focus the chat box.</dd>
+
+  <dt>Esc, Tab, Up/Down Arrows</dt>
+  <dd>When the chat box has focus, jump back to the puzzle.</li>
+
+  <dt>. (a period)</dt>
+  <dd>Jump to the last link mentioned in the chat.</dt>
+
+  <dt>"I give up"</dt>
+  <dd>If more than half of the players in the game type "I give up" in the
+  chat box, the crossword will be filled with the correct solution.</dd>
+</dl>
+</td>
+{{/MULTIPLAYER}}
+</tr></table>
+<p>(Click to hide this window.)</p>
+</div>
+
+<table cellspacing='0' cellpadding='0' id='toptable'>
+  <tr valign='top'>
+    <td><div id='crossword' style='margin-right: 2ex'></div></td>
+    <td><div id='clues'></div></td>
+  </tr>
+</table>
+
+<table cellspacing='0' cellpadding='0' style='padding-top: 1ex' id='bottomtable'>
+  <tr valign='top'>
+    <td style='width:100%'><div id='console'></div></td>
+    {{#MULTIPLAYER}}
+    <td><div id='roster'></div></td>
+    {{/MULTIPLAYER}}
+  </tr>
+</table>
+
+</body>
+</html>
+<!-- vim: set ts=2 sw=2 et : -->

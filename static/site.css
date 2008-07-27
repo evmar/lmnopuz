@@ -1,0 +1,33 @@
+body {
+  margin: 3ex 3ex;
+}
+h1 table {
+  margin-left: auto;
+  margin-right: auto;
+  border: solid 5px black;
+}
+h1 td {
+  font-family: sans-serif;
+  font-weight: bold;
+  font-size: 140%;
+  padding: 0;
+  margin:  0;
+  width:       1.5em;
+  height:      1.5em;
+  line-height: 1.5em;
+  text-align: center;
+  border: solid 1px black;
+}
+h2 {
+  font-size: 120%;
+}
+td.column {
+  padding: 0 3ex;
+}
+address {
+  font-size: 70%;
+  margin-top: 3em;
+  padding-top: 1em;
+  border-top: solid 1px gray;
+  text-align: right;
+}

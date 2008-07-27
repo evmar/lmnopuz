@@ -1,0 +1,34 @@
+# lmnopuz, a DHTML crossword service
+# Copyright (C) 2007 Evan Martin <martine@danga.com>
+
+== Requirements
+apt-get install ruby1.8 libamrita-ruby1.8
+gem install mongrel
+gem install json
+
+== Usage
+./server --help
+
+== Running lmnopuz on your own server
+Two ways:
+1) Just run it on some random port and tell your friends about that port.
+2) Or, use reverse proxying to "hook in" the server to a directory on
+your existing site.  Here's how to do it with Apache's mod_proxy:
+  ProxyRequests off
+  <Proxy *>
+    Order deny,allow
+    Allow from all
+  </Proxy>
+  # proxy requests to the crossword server...
+  # and rewrite its responses to the right address
+  ProxyPass        /software/lmnopuz/demo/ http://localhost:2000/
+  ProxyPassReverse /software/lmnopuz/demo/ http://localhost:2000/
+You can then bring up the server with the --localhost flag and your server
+won't publish port 2000 to the world.
+
+== Home page
+http://neugierig.org/software/lmnopuz/
+
+== Authors
+Evan Martin <martine@danga.com>
+Dan Erat <dan@erat.org>

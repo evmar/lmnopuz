@@ -1,0 +1,40 @@
+#!/usr/bin/ruby -Ilib
+
+require 'optparse'
+require 'puz'
+
+opts = OptionParser.new
+opts.banner = "Usage: #{$0} [options] filename.puz"
+dump_clues = false
+dump_numbers = false
+dump_solution = false
+debug = false
+opts.on('--clues', 'Output clues') { |dump_clues| }
+opts.on('--numbers', 'Output numbers') { |dump_numbers| }
+opts.on('--solution', 'Output solution') { |dump_solution| }
+opts.on('--debug', 'Verbose puzzle info') { |debug| }
+opts.parse! ARGV
+
+filename = ARGV.shift
+unless filename
+  puts opts
+  exit 1
+end
+
+File.open(filename) do |f|
+  c = Crossword.new.parse(f)
+  p c if debug
+  puts <<-EOT
+Title: #{c.title}
+Author: #{c.author}
+Copyright: #{c.copyright}
+Size: #{c.width}x#{c.height}
+
+  EOT
+
+  c.show_clues if dump_clues
+  c.show_numbers if dump_numbers
+  c.show_solution if dump_solution
+end
+
+# vim: set ts=2 sw=2 et :

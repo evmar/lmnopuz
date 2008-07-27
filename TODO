@@ -1,0 +1,33 @@
+== necessary before "done"
+fix focusbox stealing mouse events (you can't click on the focused square
+  to switch direction anymore since the focusbox gets the click, and it
+  also steals the focus when you click on the console entry box twice)
+allow indexing a whole tree of puzzle files (like we have right now)
+finish /session and /crossword puzzle selection
+let you choose a new puzzle after you've finished one in a session
+eliminate vertical scroll bar in a non-crappy manner -- see handleResize()
+  in crossword.html
+figure out a way to handle all these users who can't see the chat due
+  to a small screen
+fix caching (of crossword js)
+add a way to give up in singleplayer mode
+
+== nice features
+make user roster less empty (maybe show percentage contribution to puzzle?)
+web2.0-style "flash" highlighting changes to the puzzle
+"googling" support:  [foo bar] does the query and notifies others, and also
+  some way to paste in the snippet results
+typing a number should go to that clue (maybe not necessary, since you can
+  just hit '.' to go to a clue that someone refers to in chat)
+figure out some way to handle accidental answer-stealing:
+  imagine A has typed in CORRECT and B comes over and types in MYGUESS; then
+  once they realize that CORRECT was correct, B will get credit for all of
+  that except the E.  (maybe we could track for each cell who was the first
+  to get it right?)
+don't linkify clues that don't exist
+fix safari label support :(
+
+== perpetually needs checking with each new version
+fix ffox/win memory leak
+investigate cpu usage
+update help text

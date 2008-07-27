@@ -1,0 +1,12 @@
+<h2>New Session</h2>
+<p>Session name: {{NAME}}.</p>
+<form method='POST'>
+Crossword:
+<blockquote>
+{{#SESSION}}
+  <label><input type='radio' name='crossword' value="{{NAME}}">{{TITLE}}</label>
+  <br/>
+{{/SESSION}}
+</blockquote>
+<input type='submit' value='Start'>
+</form>

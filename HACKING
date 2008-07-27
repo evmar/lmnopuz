@@ -1,0 +1,58 @@
+== URL structure
+We serve these paths (angle brackets indicates a runtime value):
+  /crossword/
+    list of crosswords with links to them
+  /crossword/<crossword>/
+    the dhtml crossword html
+  /crossword/<crossword>/crossword.js
+    the json data for this specific crossword
+  /session/
+    list of running games with links to them
+  /session/<session>/
+    same data served off of /crossword/<crossword>/ but also understands
+    multiplayer requests
+  /session/<session>/state.js
+    multiplayer game state, pulled by networking code
+
+
+== Client-to-server communication
+The client sends newline-separated events to the server.
+An event contains an event type, a tab, and then a tab-separated list of
+parameters.
+
+Event types and parameters:
+  msg:
+    text to send
+  name (name change):
+    new name
+  xy (letter fill):
+    x position
+    y position
+    updated character (lowercase signifies a guess)
+  cursor:
+    x position
+    y position
+  disconnect
+
+
+== Server-to-client communication
+The 'cells' string sent from the server to the client contains information
+about cells that have changed since the client's last state request.  Each
+changed cell is represented by four bytes: x-position, y-position, ASCII
+letter (lowercase for guesses, uppercase otherwise), and the ASCII session
+UID of the player who modified the cell.
+
+== Profiling
+gem install ruby-prof
+ruby-prof -p graph_html -m 1 -- ./server --data ../crosswords/NYT/2006/ > html
+vi html  # edit out the junk that ./server output at the top
+firefox html
+
+You can add the --debug flag to make it so fetching /quit off the server
+stops it.  This allows you to fetch some pages and then have the server shut
+itself down.
+
+== Performance testing
+sudo apt-get install httperf
+httperf --hog --server localhost --port 2000 --num-conn 2000
+
